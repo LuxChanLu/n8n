@@ -5,7 +5,7 @@ import type {
 	INodeProperties,
 	JsonObject,
 } from 'n8n-workflow';
-import { NodeApiError } from 'n8n-workflow';
+import { NodeApiError, sleep } from 'n8n-workflow';
 
 import { createTransport } from 'nodemailer';
 import type SMTPTransport from 'nodemailer/lib/smtp-transport';
@@ -135,6 +135,49 @@ const properties: INodeProperties[] = [
 				placeholder: 'info@example.com',
 				description: 'The email address to send the reply to',
 			},
+			{
+				displayName: 'Batching',
+				name: 'batching',
+				placeholder: 'Add Batching',
+				type: 'fixedCollection',
+				typeOptions: {
+					multipleValues: false,
+				},
+				default: {
+					batch: {},
+				},
+				options: [
+					{
+						displayName: 'Batching',
+						name: 'batch',
+						values: [
+							{
+								displayName: 'Items per Batch',
+								name: 'batchSize',
+								type: 'number',
+								typeOptions: {
+									minValue: -1,
+								},
+								default: 50,
+								description:
+									'Input will be split in batches to throttle requests. -1 for disabled. 0 will be treated as 1.',
+							},
+							{
+								// eslint-disable-next-line n8n-nodes-base/node-param-display-name-miscased
+								displayName: 'Batch Interval (ms)',
+								name: 'batchInterval',
+								type: 'number',
+								typeOptions: {
+									minValue: 0,
+								},
+								default: 1000,
+								description:
+									'Time (in milliseconds) between each batch of requests. 0 for disabled.',
+							},
+						],
+					},
+				],
+			},
 		],
 	},
 ];
@@ -154,6 +197,7 @@ type EmailSendOptions = {
 	ccEmail?: string;
 	bccEmail?: string;
 	replyTo?: string;
+	batching?: { batch?: { batchSize?: number; batchInterval?: number } };
 };
 
 function configureTransport(credentials: IDataObject, options: EmailSendOptions) {
@@ -183,6 +227,7 @@ export async function execute(this: IExecuteFunctions): Promise<INodeExecutionDa
 	const items = this.getInputData();
 
 	const returnData: INodeExecutionData[] = [];
+	const sendMailPromises = [];
 	let item: INodeExecutionData;
 
 	for (let itemIndex = 0; itemIndex < items.length; itemIndex++) {
@@ -238,19 +283,31 @@ export async function execute(this: IExecuteFunctions): Promise<INodeExecutionDa
 				}
 			}
 
-			const info = await transporter.sendMail(mailOptions);
+			// defaults batch size to 1 of it's set to 0
+			const batchSize = options.batching?.batch?.batchSize ?? 1;
+			const batchInterval = options.batching?.batch?.batchInterval ?? 1000;
 
-			returnData.push({
-				json: info as unknown as IDataObject,
-				pairedItem: {
-					item: itemIndex,
-				},
-			});
+			if (itemIndex > 0 && batchSize >= 0 && batchInterval > 0) {
+				if (itemIndex % batchSize === 0) {
+					await sleep(batchInterval);
+				}
+			}
+
+			sendMailPromises.push(transporter.sendMail(mailOptions));
 		} catch (error) {
+		}
+	}
+
+	const promisesResponses = await Promise.allSettled(sendMailPromises);
+
+	let response: any;
+	for (let itemIndex = 0; itemIndex < items.length; itemIndex++) {
+		response = promisesResponses.shift();
+		if (response!.status !== 'fulfilled') {
 			if (this.continueOnFail()) {
 				returnData.push({
 					json: {
-						error: error.message,
+						error: response.reason.message,
 					},
 					pairedItem: {
 						item: itemIndex,
@@ -258,9 +315,15 @@ export async function execute(this: IExecuteFunctions): Promise<INodeExecutionDa
 				});
 				continue;
 			}
-			delete error.cert;
-			throw new NodeApiError(this.getNode(), error as JsonObject);
+			delete response.reason.cert;
+			throw new NodeApiError(this.getNode(), response.reason as JsonObject);
 		}
+		returnData.push({
+			json: response.value as unknown as IDataObject,
+			pairedItem: {
+				item: itemIndex,
+			},
+		});
 	}
 
 	return this.prepareOutputData(returnData);
